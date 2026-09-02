@@ -9,7 +9,7 @@ import { definePluginSettings } from "@api/Settings";
 import { copyToClipboard } from "@utils/clipboard";
 import { Logger } from "@utils/Logger";
 import definePlugin, { OptionType } from "@utils/types";
-import { ChannelStore, FluxDispatcher, GuildStore, Toasts, UserStore } from "@webpack/common";
+import { ChannelStore, FluxDispatcher, GuildStore, SelectedChannelStore, Toasts, UserStore } from "@webpack/common";
 
 const logger = new Logger("VoiceServerIP", "#43b581");
 
@@ -34,9 +34,21 @@ const settings = definePluginSettings({
         description: "Уведомлять о медиа-соединениях, которые не удалось опознать",
         default: true
     },
+    knownAddresses: {
+        type: OptionType.STRING,
+        displayName: "Известные адреса",
+        description: "Адреса, о которых не уведомлять: по одному в строке, адрес IPv4 или подсеть вида 1.1.1.0/24. Строка, начинающаяся с #, пропускается",
+        default: "",
+        multiline: true,
+        placeholder: "66.22.196.0/24\n66.22.200.15",
+        isValid(value: string) {
+            const { errors } = parseKnownAddresses(value ?? "");
+            return errors.length ? `Адрес не разобран: ${errors[0]}` : true;
+        }
+    },
     copyWithPort: {
         type: OptionType.BOOLEAN,
-        description: "Копировать вместе с портом (ip:port), а не только IP",
+        description: "Копировать адрес вместе с портом (ip:port)",
         default: false
     },
     permanent: {
@@ -46,7 +58,7 @@ const settings = definePluginSettings({
     },
     logToConsole: {
         type: OptionType.BOOLEAN,
-        description: "Дублировать всё в консоль DevTools (полезно для отладки)",
+        description: "Дублировать всё в консоль DevTools",
         default: true
     }
 });
@@ -87,28 +99,101 @@ function hostOf(url: string) {
     }
 }
 
+interface Subnet {
+    base: number;
+    mask: number;
+}
+
+function ipToInt(ip: string) {
+    const parts = ip.split(".");
+    if (parts.length !== 4) return null;
+
+    let value = 0;
+    for (const part of parts) {
+        if (!/^\d{1,3}$/.test(part)) return null;
+
+        const octet = Number(part);
+        if (octet > 255) return null;
+
+        value = value * 256 + octet;
+    }
+    return value;
+}
+
+function parseKnownAddresses(raw: string) {
+    const nets: Subnet[] = [];
+    const errors: string[] = [];
+
+    for (const line of raw.split("\n")) {
+        const entry = line.trim();
+        if (!entry || entry.startsWith("#")) continue;
+
+        const [address, bitsRaw] = entry.split("/");
+        const base = ipToInt(address);
+        const bits = bitsRaw === undefined ? 32 : Number(bitsRaw);
+
+        if (base === null || !Number.isInteger(bits) || bits < 0 || bits > 32) {
+            errors.push(entry);
+            continue;
+        }
+
+        const mask = bits === 0 ? 0 : (-1 << (32 - bits)) >>> 0;
+        nets.push({ base: (base & mask) >>> 0, mask });
+    }
+
+    return { nets, errors };
+}
+
+let knownCache: { raw: string; nets: Subnet[]; } | null = null;
+
+function isKnownAddress(ip: string) {
+    const raw = settings.store.knownAddresses ?? "";
+    if (!raw.trim()) return false;
+
+    if (knownCache?.raw !== raw)
+        knownCache = { raw, nets: parseKnownAddresses(raw).nets };
+
+    const value = ipToInt(ip);
+    if (value === null) return false;
+
+    return knownCache.nets.some(net => ((value & net.mask) >>> 0) === net.base);
+}
+
+function channelName(channelId: string | null | undefined) {
+    if (!channelId) return null;
+
+    const channel = ChannelStore.getChannel(channelId);
+    if (!channel) return null;
+    if (channel.name) return channel.name;
+
+    // У личных и групповых звонков имени нет, остаются имена собеседников
+    const recipients: any[] = (channel as any).rawRecipients ?? [];
+    const names = recipients.map(r => r?.username).filter(Boolean);
+    return names.length ? names.join(", ") : null;
+}
+
 function describeVoice(e: any) {
+    // Канала в событии может не быть: к моменту его прихода канал уже выбран в клиенте
+    const channelId = e.channelId ?? e.channel_id ?? SelectedChannelStore.getVoiceChannelId();
+    const name = channelName(channelId);
+    if (name) return name;
+
     const guildId = e.guildId ?? e.guild_id;
-    const channelId = e.channelId ?? e.channel_id;
-
-    const guild = guildId && GuildStore.getGuild(guildId);
-    if (guild) return guild.name;
-
-    const channel = channelId && ChannelStore.getChannel(channelId);
-    return channel?.name ?? "личный звонок";
+    return GuildStore.getGuild(guildId)?.name ?? "личный звонок";
 }
 
 /** stream_key: "guild:<guildId>:<channelId>:<userId>" либо "call:<channelId>:<userId>" */
 function describeStream(streamKey: string) {
     const parts = String(streamKey).split(":");
     const ownerId = parts[parts.length - 1];
+    const channel = channelName(parts[parts.length - 2]);
     const isOwn = !!ownerId && ownerId === UserStore.getCurrentUser()?.id;
-    const owner = ownerId ? UserStore.getUser(ownerId) : null;
 
-    return {
-        isOwn,
-        label: isOwn ? "твой стрим" : `стрим ${owner?.username ?? ownerId ?? "?"}`
-    };
+    if (isOwn) return { isOwn, label: channel ?? "стрим" };
+
+    const owner = ownerId ? UserStore.getUser(ownerId) : null;
+    const who = `стрим ${owner?.username ?? ownerId ?? "?"}`;
+    return { isOwn, label: channel ? `${channel} · ${who}` : who };
 }
 
 function onVoiceServerUpdate(e: any) {
@@ -164,22 +249,33 @@ function report(wsUrl: string, ip: string, port: number, info: PendingConn | nul
     const kind = info?.kind ?? null;
     const host = hostOf(wsUrl);
     const address = `${ip}:${port}`;
+    const known = isKnownAddress(ip);
 
     if (settings.store.logToConsole)
-        logger.info(`${titleFor(kind)}: ${address} (${host})${info ? ` — ${info.label}` : ""}`);
+        logger.info(
+            `${titleFor(kind)}: ${address} (${host})${info ? ` — ${info.label}` : ""}` +
+            (known ? " — адрес в списке известных, уведомление пропущено" : "")
+        );
 
-    if (!isEnabledFor(kind)) return;
+    if (known || !isEnabledFor(kind)) return;
 
     const dedupeKey = `${kind ?? "?"}|${address}`;
     const now = Date.now();
     if (now - (recent.get(dedupeKey) ?? 0) < DEDUPE_MS) return;
     recent.set(dedupeKey, now);
 
+    const lines = [address, info?.label ?? "не опознано", host].join("\n");
     const toCopy = settings.store.copyWithPort ? address : ip;
 
     showNotification({
         title: titleFor(kind),
-        body: `${address} — ${info?.label ?? "не опознано"} · ${host}`,
+        // body уходит в системное уведомление и в журнал, richBody — во внутреннее окно
+        body: lines,
+        richBody: (
+            <p className="vc-notification-p" style={{ whiteSpace: "pre-line" }}>
+                {lines}
+            </p>
+        ),
         color: kind === "voice" ? "#43b581" : "#5865f2",
         permanent: settings.store.permanent,
         onClick() {
@@ -279,5 +375,6 @@ export default definePlugin({
         uninstallHook();
         pending.clear();
         recent.clear();
+        knownCache = null;
     }
 });
